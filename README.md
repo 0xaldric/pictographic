@@ -48,6 +48,15 @@ pip install -r webapp/requirements.txt && pip install -e .
 uvicorn webapp.app:app --reload      # open http://127.0.0.1:8000
 ```
 
+Deploy the demo to **Railway** straight from this source (the `Dockerfile` does
+`pip install .`, so no PyPI publish is needed):
+
+```bash
+railway init --name pictographic     # create + link a project
+railway up -c -y                     # upload current dir, build the Dockerfile, deploy
+railway domain                       # get a public URL
+```
+
 Layout:
 
 ```
