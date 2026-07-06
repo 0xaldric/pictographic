@@ -1,0 +1,12 @@
+.git
+.github
+.vscode
+dist
+build
+*.egg-info
+out
+out_steps
+.venv
+__pycache__
+*.pyc
+.DS_Store

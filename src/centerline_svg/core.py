@@ -1,36 +1,39 @@
-#!/usr/bin/env python3
 """
-Centerline extraction: PNG (solid black shape) -> SVG tracing the medial axis.
+Centerline extraction core: PNG (solid shape) -> SVG tracing the medial axis.
 
-Pure standard library only (zlib, struct, math). One function per pipeline step so
-each part can be read and verified on its own. See README.md for the why.
+Pure standard library only (zlib, struct, math). One function per pipeline step, wired
+together by the fluent `Pipeline` class. The rendering / step-image helpers live in
+`render.py`; this module is the algorithm only. See README.md for the "why".
 
 Pipeline:
-  1. read_png            decode PNG by hand (parse chunks, inflate, undo filters)
+  1. decode_png          decode PNG by hand (parse chunks, inflate, undo filters)
   2. to_mask             threshold to a 1-bit foreground mask (padded grid)
   3. zhang_suen          morphological thinning -> 1px skeleton
+     cleanup_skeleton    remove staircase artifacts
   4. distance_transform  two-pass chamfer, used for stroke width + spur pruning
-  5. build_graph/trace   skeleton pixels -> graph edges (polyline branches)
+  5. trace_branches      skeleton pixels -> graph edges (polyline branches)
   6. prune               drop tiny spur branches
+     smooth              straighten strokes, re-solve junctions, smooth curves
   7. to_svg              emit stroked <path> per branch
 """
 
 from __future__ import annotations  # lets us write list[int] / int | None on Python 3.9
 
-import sys
 import os
 import zlib
 import struct
 import math
 
-
 # ----------------------------------------------------------------------------
 # Type aliases — named so a signature says what a value *means*, not just its shape.
 # ----------------------------------------------------------------------------
-Grid = bytearray  # padded 1-D image grid, row-major, 1 byte/pixel, stride = W (=width+2)
+# padded 1-D image grid, row-major, 1 byte/pixel, stride = W (= width+2)
+Grid = bytearray
 Skeleton = set[int]  # linear indices (into the padded grid) of skeleton pixels
 Branch = list[int]  # one polyline: ordered linear indices of the pixels along an edge
 Degrees = dict[int, int]  # pixel index -> topological degree (its crossing number)
+Point = tuple[float, float]  # a real (x, y) coordinate (padding already removed)
+Polyline = list[Point]  # a branch as float points, ready to smooth / emit
 
 
 # ----------------------------------------------------------------------------
@@ -47,14 +50,11 @@ def _paeth(a: int, b: int, c: int) -> int:
     return c
 
 
-def read_png(path: str) -> tuple[int, int, int, bytes]:
-    """Return (width, height, channels, raw_bytes). raw_bytes is the de-filtered,
-    row-major sample data: channels bytes per pixel, width*channels bytes per row."""
+def decode_png(data: bytes) -> tuple[int, int, int, bytes]:
+    """Decode raw PNG bytes -> (width, height, channels, raw_bytes). raw_bytes is the
+    de-filtered, row-major sample data: channels bytes per pixel, width*channels per row.
+    Supports 8-bit grayscale / RGB / (gray|rgb)+alpha; no palette, no interlacing."""
     # follow https://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html
-    with open(path, "rb") as fh:
-        data = fh.read()
-
-    # Just check the PNG signature; don't bother with CRCs or ancillary chunks.
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("not a PNG")
 
@@ -67,24 +67,18 @@ def read_png(path: str) -> tuple[int, int, int, bytes]:
         ctype = data[pos + 4 : pos + 8]
         cdata = data[pos + 8 : pos + 8 + length]
         pos += 12 + length  # 4 len + 4 type + data + 4 crc
-        # Image headers
         if ctype == b"IHDR":
             width, height, bit_depth, color_type = struct.unpack(">IIBB", cdata[:10])
-        # Image data chunk
         elif ctype == b"IDAT":
             idat += cdata
-        # Image end chunk
         elif ctype == b"IEND":
             break
 
-    print(f"PNG: {width}x{height}, bit_depth={bit_depth}, color_type={color_type}")
-    print(f"width={width}, height={height}, bit_depth={bit_depth}, color_type={color_type}")
-
     if bit_depth != 8:
-        raise ValueError("only 8-bit PNGs supported (got %d)" % bit_depth)
-    channels: int = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+        raise ValueError("only 8-bit PNGs supported (got %r)" % bit_depth)
     if color_type == 3:
         raise ValueError("palette PNGs not supported")
+    channels: int = {0: 1, 2: 3, 4: 2, 6: 4}[color_type]
 
     # --- inflate, then undo the per-scanline filter ---
     raw: bytes = zlib.decompress(bytes(idat))
@@ -121,6 +115,12 @@ def read_png(path: str) -> tuple[int, int, int, bytes]:
     return width, height, channels, bytes(out)
 
 
+def read_png(path: str) -> tuple[int, int, int, bytes]:
+    """Read a PNG file from disk. See `decode_png`."""
+    with open(path, "rb") as fh:
+        return decode_png(fh.read())
+
+
 # ----------------------------------------------------------------------------
 # Step 2 — threshold to a binary mask on a 1-px padded grid
 # ----------------------------------------------------------------------------
@@ -138,7 +138,7 @@ def to_mask(
         row = (y + 1) * W
         for x in range(width):
             o = base + x * channels
-            # luminance follow ITU-R BT.601, https://en.wikipedia.org/wiki/YCbCr#ITU-R_BT.601_conversion
+            # luminance per ITU-R BT.601
             if channels >= 3:
                 lum = (299 * raw[o] + 587 * raw[o + 1] + 114 * raw[o + 2]) // 1000
             else:  # grayscale / gray+alpha
@@ -390,17 +390,223 @@ def prune(branches: list[Branch], deg: Degrees, W: int, min_len: float) -> list[
 
 
 # ----------------------------------------------------------------------------
+# Step 6b — straighten strokes / re-solve junctions / smooth curves
+# ----------------------------------------------------------------------------
+def branch_to_points(branch: Branch, W: int) -> Polyline:
+    """Linear indices -> real (x, y) float points (undo the 1-px padding)."""
+    return [(float(i % W - 1), float(i // W - 1)) for i in branch]
+
+
+def _perp_dist(p: Point, a: Point, b: Point) -> float:
+    """Perpendicular distance from point p to the line through a and b."""
+    (px, py), (ax, ay), (bx, by) = p, a, b
+    dx, dy = bx - ax, by - ay
+    seg = math.hypot(dx, dy)
+    if seg < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    return abs((px - ax) * dy - (py - ay) * dx) / seg
+
+
+def rdp(points: Polyline, eps: float) -> Polyline:
+    """Ramer-Douglas-Peucker: keep only the vertices that carry the shape (those farther
+    than `eps` from the chord), dropping the rest. This turns a staircased/wobbly run into
+    clean straight segments — a straight stroke collapses to just 2 endpoints."""
+    if len(points) < 3:
+        return points[:]
+    dmax, idx = 0.0, 0
+    for k in range(1, len(points) - 1):
+        d = _perp_dist(points[k], points[0], points[-1])
+        if d > dmax:
+            dmax, idx = d, k
+    if dmax > eps:  # a real corner/bend lives here -> split and recurse
+        left = rdp(points[: idx + 1], eps)
+        right = rdp(points[idx:], eps)
+        return left[:-1] + right
+    return [points[0], points[-1]]  # everything between is within eps of the chord
+
+
+def _chaikin_open(points: Polyline, iterations: int) -> Polyline:
+    """Chaikin corner-cutting on an open polyline; endpoints stay fixed so branches that
+    share a junction remain joined."""
+    for _ in range(iterations):
+        if len(points) < 3:
+            break
+        new: Polyline = [points[0]]
+        for a, b in zip(points, points[1:]):
+            new.append((0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]))
+            new.append((0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]))
+        new.append(points[-1])
+        points = new
+    return points
+
+
+def _chaikin_closed(points: Polyline, iterations: int) -> Polyline:
+    """Chaikin on a closed loop (wraps around; no fixed endpoints)."""
+    for _ in range(iterations):
+        if len(points) < 3:
+            break
+        new: Polyline = []
+        n = len(points)
+        for k in range(n):
+            a, b = points[k], points[(k + 1) % n]
+            new.append((0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]))
+            new.append((0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]))
+        points = new
+    return points
+
+
+def _straighten_junction_ends(
+    points: Polyline, start_junc: bool, end_junc: bool, radius: float
+) -> Polyline:
+    """Replace the wiggle within `radius` of a junction endpoint with a straight run from
+    the node to the first point that is `radius` away — so the branch meets the junction
+    in a straight line instead of the medial axis's little hook."""
+    if len(points) < 3:
+        return points
+    pts = points
+    if start_junc:
+        j = 1
+        while j < len(pts) - 1 and math.dist(pts[j], pts[0]) < radius:
+            j += 1
+        pts = [pts[0]] + pts[j:]
+    if end_junc and len(pts) >= 3:
+        j = len(pts) - 2
+        while j > 0 and math.dist(pts[j], pts[-1]) < radius:
+            j -= 1
+        pts = pts[: j + 1] + [pts[-1]]
+    return pts
+
+
+def _fit_line_tls(pts: Polyline) -> tuple[Point, Point]:
+    """Total-least-squares line fit: returns (centroid, unit direction). Unlike the chord
+    between the endpoints, this is insensitive to where the ends bend."""
+    n = len(pts)
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    sxx = syy = sxy = 0.0
+    for x, y in pts:
+        dx, dy = x - mx, y - my
+        sxx += dx * dx
+        syy += dy * dy
+        sxy += dx * dy
+    theta = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+    return (mx, my), (math.cos(theta), math.sin(theta))
+
+
+def _fit_straight(
+    points: Polyline, trim: float, tol: float = 3.0
+) -> tuple[Point, Point, tuple[Point, Point]] | None:
+    """Detect a genuinely straight stroke and return it dead straight.
+
+    The medial axis of a straight stroke bends near its ends (at caps cut at an angle and
+    at junctions), so we fit the line to the STABLE INTERIOR only — the points more than
+    `trim` (≈ one stroke width) of arc length away from either end. If every interior
+    point sits within `tol` of that TLS line, the branch is a straight stroke: return the
+    original endpoints PROJECTED onto the fitted line (so the bent tail can no longer
+    rotate the axis) plus the line itself for junction re-solving. Curves and L-shaped
+    branches deviate far more than `tol` and return None."""
+    if len(points) < 5:
+        return None
+    cum = [0.0]
+    for a, b in zip(points, points[1:]):
+        cum.append(cum[-1] + math.dist(a, b))
+    total = cum[-1]
+    if total < 4 * tol:
+        return None
+    interior = [p for p, s in zip(points, cum) if trim <= s <= total - trim]
+    if len(interior) < 5:
+        interior = points
+    c, d = _fit_line_tls(interior)
+    nx, ny = -d[1], d[0]  # unit normal
+
+    def perp(p: Point) -> float:
+        return abs((p[0] - c[0]) * nx + (p[1] - c[1]) * ny)
+
+    if max(perp(p) for p in interior) > tol:
+        return None
+
+    def proj(p: Point) -> Point:
+        t = (p[0] - c[0]) * d[0] + (p[1] - c[1]) * d[1]
+        return (c[0] + t * d[0], c[1] + t * d[1])
+
+    return proj(points[0]), proj(points[-1]), (c, d)
+
+
+def _lsq_node(lines: list[tuple[Point, Point]], fallback: Point) -> Point:
+    """The point minimizing the summed squared perpendicular distance to all `lines`
+    ((centroid, direction) pairs) — i.e. the best common intersection of the stroke axes.
+    Falls back when the system is degenerate (nearly parallel lines)."""
+    a11 = a12 = a22 = b1 = b2 = 0.0
+    for c, d in lines:
+        nx, ny = -d[1], d[0]
+        s = nx * c[0] + ny * c[1]
+        a11 += nx * nx
+        a12 += nx * ny
+        a22 += ny * ny
+        b1 += nx * s
+        b2 += ny * s
+    det = a11 * a22 - a12 * a12
+    if abs(det) < 1e-9:
+        return fallback
+    return ((a22 * b1 - a12 * b2) / det, (a11 * b2 - a12 * b1) / det)
+
+
+def _turn_angle(a: Point, b: Point) -> float:
+    """Angle (radians) between direction vectors a and b (0 = straight, pi = U-turn)."""
+    la, lb = math.hypot(*a), math.hypot(*b)
+    if la < 1e-9 or lb < 1e-9:
+        return 0.0
+    dot = (a[0] * b[0] + a[1] * b[1]) / (la * lb)
+    return math.acos(max(-1.0, min(1.0, dot)))
+
+
+def smooth_polyline(
+    points: Polyline, rdp_eps: float, chaikin_iters: int, corner_deg: float = 45.0
+) -> Polyline:
+    """Simplify then smooth one branch, but keep genuine sharp corners sharp.
+
+    A closed loop is smoothed as a closed curve. An open branch is RDP-simplified (straight
+    strokes collapse to 2 points), then we split it at vertices whose turn exceeds
+    `corner_deg` and Chaikin-smooth each straight-ish run separately — so a 90° corner
+    (an H crossbar meeting a stem, the arrow's turn, an arrowhead tip) stays a crisp corner
+    while only gentle curves get rounded. Endpoints stay fixed so junctions stay joined.
+    """
+    if len(points) >= 3 and points[0] == points[-1]:  # closed loop
+        core = _chaikin_closed(points[:-1], chaikin_iters)
+        return core + [core[0]]
+
+    v = rdp(points, rdp_eps)
+    if len(v) <= 2:
+        return v
+
+    # corner vertices = sharp turns; they split the branch into runs kept sharp between.
+    thr = math.radians(corner_deg)
+    corners = [0]
+    for k in range(1, len(v) - 1):
+        a = (v[k][0] - v[k - 1][0], v[k][1] - v[k - 1][1])
+        b = (v[k + 1][0] - v[k][0], v[k + 1][1] - v[k][1])
+        if _turn_angle(a, b) > thr:
+            corners.append(k)
+    corners.append(len(v) - 1)
+
+    out: Polyline = [v[corners[0]]]
+    for s, e in zip(corners, corners[1:]):
+        run = _chaikin_open(v[s : e + 1], chaikin_iters)
+        out.extend(run[1:])  # first already present; keep the rest incl. the corner
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Step 7 — emit SVG
 # ----------------------------------------------------------------------------
 def to_svg(
-    branches: list[Branch], W: int, width: int, height: int, stroke_width: float
+    polylines: list[Polyline], width: int, height: int, stroke_width: float
 ) -> str:
-    def d_of(path: Branch) -> str:
-        pts: list[str] = []
-        for k, i in enumerate(path):
-            x, y = i % W - 1, i // W - 1  # undo the 1-px padding
-            pts.append(("M" if k == 0 else "L") + "%d %d" % (x, y))
-        return "".join(pts)
+    def d_of(pts: Polyline) -> str:
+        out: list[str] = []
+        for k, (x, y) in enumerate(pts):
+            out.append(("M" if k == 0 else "L") + "%.1f %.1f" % (x, y))
+        return "".join(out)
 
     lines: list[str] = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -409,9 +615,9 @@ def to_svg(
         '<g fill="none" stroke="#000000" stroke-width="%g" '
         'stroke-linecap="round" stroke-linejoin="round">' % stroke_width,
     ]
-    for path in branches:
-        if len(path) >= 2:
-            lines.append('<path d="%s"/>' % d_of(path))
+    for pts in polylines:
+        if len(pts) >= 2:
+            lines.append('<path d="%s"/>' % d_of(pts))
     lines.append("</g>")
     lines.append("</svg>")
     return "\n".join(lines)
@@ -423,31 +629,27 @@ def to_svg(
 class Pipeline:
     """Builds and runs the centerline pipeline with a fluent, chainable API.
 
-    The step functions above are the pure "how"; this class is the "orchestration":
-    it carries the intermediate state between stages and the configuration, so a run
-    reads top-to-bottom as the pipeline itself:
+    The step functions above are the pure "how"; this class is the "orchestration": it
+    carries the intermediate state between stages and the configuration, so a run reads
+    top-to-bottom as the pipeline itself:
 
         svg = (Pipeline()
-                   .threshold(128)          # config
-                   .load("in.png")          # stages...
-                   .to_mask()
-                   .distance_transform()
-                   .thin()
-                   .cleanup()
-                   .trace()
-                   .prune()
-                   .to_svg()
+                   .load("in.png")
+                   .to_mask().distance_transform().thin().cleanup()
+                   .trace().prune().smooth().to_svg()
                    .result())
 
-    Every config setter and every stage returns `self`, so they can be chained. Stages
-    assume the previous stage has run (each documents what state it needs / produces).
+    Every config setter and every stage returns `self`. The read-only properties expose
+    the intermediate state (used by `render.py` for the optional step images).
     """
 
     def __init__(self) -> None:
         # --- configuration (with sensible defaults) ---
         self._threshold: int = 128  # luminance below this = foreground
         self._stroke_width: float | None = None  # None -> auto (2 * median distance)
-        self._prune_factor: float = 1.5  # drop spurs shorter than factor * median radius
+        self._prune_factor: float = (
+            1.5  # drop spurs shorter than factor * median radius
+        )
         # --- state, filled in as stages run ---
         self._w: int = 0
         self._h: int = 0
@@ -460,6 +662,7 @@ class Pipeline:
         self._skel: Skeleton | None = None
         self._deg: Degrees | None = None
         self._branches: list[Branch] | None = None
+        self._polylines: list[Polyline] | None = None
         self._svg: str | None = None
         self._stroke_used: float | None = None
 
@@ -469,7 +672,7 @@ class Pipeline:
         return self
 
     def stroke_width(self, value: float | None) -> Pipeline:
-        """Force a fixed stroke width; pass None to keep the auto (distance-transform) estimate."""
+        """Force a fixed stroke width; None keeps the auto (distance-transform) estimate."""
         self._stroke_width = value
         return self
 
@@ -479,7 +682,11 @@ class Pipeline:
 
     # ---- stages (each mutates state, returns self) ----
     def load(self, path: str) -> Pipeline:
-        self._w, self._h, self._channels, self._raw = read_png(path)
+        with open(path, "rb") as fh:
+            return self.load_bytes(fh.read())
+
+    def load_bytes(self, data: bytes) -> Pipeline:
+        self._w, self._h, self._channels, self._raw = decode_png(data)
         self._W, self._H = self._w + 2, self._h + 2
         return self
 
@@ -516,13 +723,115 @@ class Pipeline:
         )
         return self
 
+    def smooth(
+        self,
+        rdp_eps: float = 2.0,
+        chaikin_iters: int = 2,
+        junction_radius: float | None = None,
+    ) -> Pipeline:
+        """Turn each branch into its final polyline, fixing the two places the raw medial
+        axis is systematically wrong for pen strokes:
+
+        1. STRAIGHT STROKES BEND AT THEIR ENDS: near an angled end cap and near a junction
+           the medial axis hooks sideways, so a chord through the endpoints is rotated off
+           the true stroke axis. `_fit_straight` fits the axis to the stable interior only
+           and projects the endpoints onto it -> the stroke is dead straight at the true
+           angle. Curves/L-shapes fail its tolerance and get corner-aware Chaikin instead.
+        2. JUNCTIONS: the node pixel sits wherever thinning left it, not where the stroke
+           axes actually cross. We re-solve each junction as the least-squares intersection
+           of the fitted axes of its straight arms, then snap every arm's end to that node
+           — so all arms meet, straight, at one exact point."""
+        r = (
+            junction_radius
+            if junction_radius is not None
+            else self._median_radius() * 2.0
+        )
+        W = self._W
+
+        def pix_xy(i: int) -> Point:
+            return (float(i % W - 1), float(i // W - 1))
+
+        # ---- pass 1: per-branch polyline + axis fit ----
+        entries: list[dict] = []  # {"pts": Polyline, "line": (c, d) | None}
+        jends: list[tuple[int, int, int]] = []  # (entry idx, end 0|1, junction pixel)
+        for b in self._branches:
+            pts = branch_to_points(b, W)
+            closed = len(b) >= 3 and b[0] == b[-1]
+            if closed:
+                entries.append(
+                    {"pts": smooth_polyline(pts, rdp_eps, chaikin_iters), "line": None}
+                )
+                continue
+            sj = b[0] if self._deg.get(b[0], 0) >= 3 else None
+            ej = b[-1] if self._deg.get(b[-1], 0) >= 3 else None
+            pts = _straighten_junction_ends(pts, sj is not None, ej is not None, r)
+            fit = _fit_straight(pts, trim=r)
+            if fit is not None:
+                p0, p1, line = fit
+                entries.append({"pts": [p0, p1], "line": line})
+            else:
+                entries.append(
+                    {"pts": smooth_polyline(pts, rdp_eps, chaikin_iters), "line": None}
+                )
+            k = len(entries) - 1
+            if sj is not None:
+                jends.append((k, 0, sj))
+            if ej is not None:
+                jends.append((k, 1, ej))
+
+        # ---- pass 2: re-solve each junction node and snap the arms to it ----
+        # cluster junction pixels that sit within a few px of each other into one node
+        pixels = sorted({j for _, _, j in jends})
+        parent = {p: p for p in pixels}
+
+        def find(p: int) -> int:
+            while parent[p] != p:
+                parent[p] = parent[parent[p]]
+                p = parent[p]
+            return p
+
+        for a_i, p in enumerate(pixels):
+            for q in pixels[a_i + 1 :]:
+                if math.dist(pix_xy(p), pix_xy(q)) <= 4.0:
+                    parent[find(p)] = find(q)
+
+        groups: dict[int, list[tuple[int, int, int]]] = {}
+        for e, end, j in jends:
+            groups.setdefault(find(j), []).append((e, end, j))
+
+        for members in groups.values():
+            fallback = (
+                sum(pix_xy(j)[0] for _, _, j in members) / len(members),
+                sum(pix_xy(j)[1] for _, _, j in members) / len(members),
+            )
+            lines = [
+                entries[e]["line"]
+                for e, _, _ in members
+                if entries[e]["line"] is not None
+            ]
+            node = _lsq_node(lines, fallback) if len(lines) >= 2 else fallback
+            if math.dist(node, fallback) > r:  # degenerate intersection: stay local
+                node = fallback
+            for e, end, _ in members:
+                pts = entries[e]["pts"]
+                if end == 0:
+                    pts[0] = node
+                else:
+                    pts[-1] = node
+
+        self._polylines = [en["pts"] for en in entries]
+        return self
+
     def to_svg(self) -> Pipeline:
+        # if .smooth() was skipped, emit the raw branch polylines as-is
+        if self._polylines is None:
+            self._polylines = [branch_to_points(b, self._W) for b in self._branches]
         self._stroke_used = (
             self._stroke_width
             if self._stroke_width is not None
             else round(2 * self._median_radius(), 1)
         )
-        self._svg = to_svg(self._branches, self._W, self._w, self._h, self._stroke_used)
+        self._svg = to_svg(self._polylines, self._w, self._h, self._stroke_used)
         return self
 
     def save(self, out_path: str) -> Pipeline:
@@ -532,7 +841,9 @@ class Pipeline:
         return self
 
     # ---- outputs / stats ----
-    def result(self) -> str | None:
+    def result(self) -> str:
+        if self._svg is None:
+            raise RuntimeError("call .to_svg() before .result()")
         return self._svg
 
     def stats(self) -> dict[str, object]:
@@ -543,59 +854,36 @@ class Pipeline:
             "stroke_width": self._stroke_used,
         }
 
+    # ---- read-only access to intermediate state (used by render.py) ----
+    @property
+    def image_size(self) -> tuple[int, int]:
+        return (self._w, self._h)  # real width, height (without the 1-px padding)
+
+    @property
+    def stride(self) -> int:
+        return self._W  # padded row width; index = (y+1)*W + (x+1)
+
+    @property
+    def mask(self) -> Grid | None:
+        return self._mask
+
+    @property
+    def dt(self) -> list[float] | None:
+        return self._dt
+
+    @property
+    def skeleton(self) -> Skeleton | None:
+        return self._skel
+
+    @property
+    def branches(self) -> list[Branch] | None:
+        return self._branches
+
+    @property
+    def polylines(self) -> list[Polyline] | None:
+        return self._polylines
+
     # ---- helper ----
     def _median_radius(self) -> float:
         radii = sorted(self._dt[i] for i in self._skel)
         return radii[len(radii) // 2] if radii else 22.5
-
-
-# ----------------------------------------------------------------------------
-# Driver
-# ----------------------------------------------------------------------------
-def convert(in_path: str, out_path: str, verbose: bool = True) -> None:
-    p = (
-        Pipeline()
-        .load(in_path)
-        .to_mask()
-        .distance_transform()
-        .thin()
-        .cleanup()
-        .trace()
-        .prune()
-        .to_svg()
-        .save(out_path)
-    )
-    if verbose:
-        s = p.stats()
-        print(
-            "%-28s fg=%d skel=%d branches=%d width=%s"
-            % (
-                os.path.basename(in_path),
-                s["fg"],
-                s["skeleton"],
-                s["branches"],
-                s["stroke_width"],
-            )
-        )
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) == 3 and os.path.isfile(argv[1]):
-        convert(argv[1], argv[2])
-    elif len(argv) == 3 and os.path.isdir(argv[1]):
-        in_dir, out_dir = argv[1], argv[2]
-        for name in sorted(os.listdir(in_dir)):
-            if name.lower().endswith(".png"):
-                convert(
-                    os.path.join(in_dir, name),
-                    os.path.join(out_dir, name[:-4] + ".svg"),
-                )
-    else:
-        print("usage: python3 centerline.py <in.png> <out.svg>")
-        print("       python3 centerline.py <in_dir> <out_dir>")
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
